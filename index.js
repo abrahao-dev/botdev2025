@@ -4,6 +4,11 @@ const { API_URL, API_KEY } = require("./config");
 const { RSI, ATR, calculateBollingerBands, calculateMACD } = require("./utils");
 const { getBalance, newOrder, getSymbolFilters } = require("./trade");
 
+// Importar o módulo de notificações Telegram
+const telegramNotifier = require("./telegramNotifier");
+// Importar o módulo de notificações de status
+const statusNotifier = require("./statusNotifier");
+
 const SYMBOL = "BTCUSDT";
 const PERIOD = 14;
 
@@ -11,12 +16,19 @@ const PERIOD = 14;
 const FEE_RATE = 0.001;
 const TOTAL_FEE = FEE_RATE * 2;
 
-// Você não quer vender com prejuízo, então definimos lucros >= 0
-// (Se quiser pelo menos 1% de lucro, ponha 0.01)
-const MIN_PROFIT_MARGIN = 0.0;
+// Margens de lucro e prejuízo
+// Lucro mínimo de 1.5% para compensar as taxas e ter algum ganho
+const MIN_PROFIT_MARGIN = 0.015;
 
-// Take Profit se o preço subir 15% acima do buyPrice + taxas
-const TAKE_PROFIT_PERCENT = 0.15;
+// Take Profit mais conservador (8%)
+const TAKE_PROFIT_PERCENT = 0.08;
+
+// Stop Loss para proteção contra quedas (3%)
+const STOP_LOSS_PERCENT = 0.03;
+
+// Níveis de RSI ajustados para maior precisão
+const RSI_BUY_THRESHOLD = 35;  // Menos agressivo na compra (era 30)
+const RSI_SELL_THRESHOLD = 65; // Menos agressivo na venda (era 70)
 
 const STATE_FILE = "./state.json";
 const TRADES_FILE = "./trades.json";
@@ -63,6 +75,10 @@ async function initializeBot() {
       buyPrice = 0;
     }
     saveState({ isOpened, buyPrice });
+    
+    // Enviar notificação de inicialização do bot
+    statusNotifier.notifyInitialization()
+      .catch(err => console.error("Erro ao enviar notificação de inicialização:", err.message));
   } catch (error) {
     console.error("Erro ao inicializar o bot:", error.message);
   }
@@ -136,15 +152,26 @@ async function start() {
     console.log(`MACD: Line=${macd.line.toFixed(2)}, Signal=${macd.signal.toFixed(2)}`);
     console.log(`Já comprei? ${isOpened}, Preço atual: ${lastPrice}`);
 
-    // Lógica de compra: RSI < 30
-    if (rsi < 30 && !isOpened) {
-      console.log("RSI abaixo de 30 => compra");
+    // Lógica de compra: RSI < 35
+    if (rsi < RSI_BUY_THRESHOLD && !isOpened) {
+      console.log("RSI abaixo de 35 => compra");
       const orderSuccess = await placeOrder(SYMBOL, "BUY", lastPrice);
       if (orderSuccess) {
         isOpened = true;
         buyPrice = lastPrice;
         saveState({ isOpened, buyPrice });
         console.log("Compra realizada com sucesso!");
+
+        // Enviar notificação de compra via Telegram
+        telegramNotifier.notifyBuy({
+          quantity: 0.001, // Quantidade fixa para teste
+          price: lastPrice,
+          rsi: rsi.toFixed(2)
+        })
+        .then(result => {
+          if (result) console.log("Notificação de compra enviada com sucesso!");
+        })
+        .catch(err => console.error("Erro ao enviar notificação Telegram:", err.message));
       } else {
         console.log("Compra falhou. Tentará novamente na próxima verificação.");
       }
@@ -161,18 +188,38 @@ async function start() {
         return;
       }
 
-      // Checa se RSI está > 70 (sobrecomprado) ou se chegou no TAKE_PROFIT
-      const rsiHigh = (rsi > 70);
+      // Checa se RSI está > 65 (sobrecomprado) ou se chegou no TAKE_PROFIT
+      const rsiHigh = (rsi > RSI_SELL_THRESHOLD);
       const priceHighEnough = (lastPrice >= buyPrice * (1 + TAKE_PROFIT_PERCENT));
 
-      if (rsiHigh || priceHighEnough) {
-        console.log("Condições de venda atendidas (RSI alto ou take profit).");
+      // Verifica se atingiu o stop loss (preço caiu abaixo do limite definido)
+      const hitStopLoss = (lastPrice <= buyPrice * (1 - STOP_LOSS_PERCENT));
+
+      if (rsiHigh || priceHighEnough || hitStopLoss) {
+        // Mensagem diferente dependendo do motivo da venda
+        if (hitStopLoss) {
+          console.log("Stop Loss acionado. Vendendo para limitar perdas.");
+        } else {
+          console.log("Condições de venda atendidas (RSI alto ou take profit).");
+        }
+
         const sellSuccess = await placeOrder(SYMBOL, "SELL", lastPrice);
         if (sellSuccess) {
           isOpened = false;
           buyPrice = 0;
           saveState({ isOpened, buyPrice });
           console.log("Venda realizada com sucesso!");
+
+          // Enviar notificação de venda via Telegram
+          telegramNotifier.notifySell({
+            quantity: 0.001, // Quantidade fixa para teste
+            price: lastPrice,
+            profit: profit
+          })
+          .then(result => {
+            if (result) console.log("Notificação de venda enviada com sucesso!");
+          })
+          .catch(err => console.error("Erro ao enviar notificação Telegram:", err.message));
         } else {
           console.log("Venda falhou. Tentará novamente na próxima verificação.");
         }
@@ -180,6 +227,10 @@ async function start() {
     }
   } catch (error) {
     console.error("Erro ao buscar dados da Binance:", error.response ? JSON.stringify(error.response.data, null, 2) : error.message);
+
+    // Enviar notificação de erro via Telegram
+    telegramNotifier.notifyError(`Erro ao buscar dados da Binance: ${error.message}`)
+      .catch(err => console.error("Erro ao enviar notificação Telegram:", err.message));
   }
 }
 
@@ -199,37 +250,65 @@ async function placeOrder(symbol, side, price) {
     const stepSize = filters.LOT_SIZE.stepSize;
 
     let quantity = 0;
+
     if (side === "BUY") {
+      // Obter saldo em USDT
       const usdtBalance = await getBalance("USDT");
-      const maxQuantity = usdtBalance / price;
-      quantity = quantizeQuantity(maxQuantity, stepSize);
-    } else if (side === "SELL") {
+
+      // Verificar se tem saldo suficiente
+      if (usdtBalance < 10) { // Mínimo de 10 USDT para operar
+        console.log("Saldo USDT insuficiente para comprar.");
+
+        // Notificar sobre carteira vazia
+        telegramNotifier.notifyEmptyWallet()
+          .catch(err => console.error("Erro ao enviar notificação Telegram:", err.message));
+
+        return false;
+      }
+
+      // Usar 95% do saldo para comprar (deixar margem para taxas)
+      const investAmount = usdtBalance * 0.95;
+      quantity = investAmount / price;
+    } else { // SELL
+      // Obter saldo em BTC
       const btcBalance = await getBalance("BTC");
-      quantity = quantizeQuantity(btcBalance, stepSize);
+
+      // Verificar se tem saldo suficiente
+      if (btcBalance < minQty) {
+        console.log("Saldo BTC insuficiente para vender.");
+
+        // Notificar sobre carteira vazia
+        telegramNotifier.notifyEmptyWallet()
+          .catch(err => console.error("Erro ao enviar notificação Telegram:", err.message));
+
+        return false;
+      }
+
+      // Vender 100% do saldo
+      quantity = btcBalance;
     }
 
+    // Ajustar quantidade de acordo com stepSize
+    quantity = quantizeQuantity(quantity, stepSize);
+
+    // Verificar se a quantidade é maior que o mínimo
     if (quantity < minQty) {
-      console.error("Quantidade inválida para ordem");
+      console.log(`Quantidade ${quantity} abaixo do mínimo ${minQty}`);
       return false;
     }
 
     console.log(`Tentando ${side} ${quantity} BTC a ${price} USDT`);
-    const orderSuccess = await newOrder(symbol, side, price);
 
-    if (orderSuccess) {
-      saveTrade({
-        timestamp: Date.now(),
-        symbol,
-        side,
-        price,
-        quantity,
-        status: "FILLED",
-      });
-    }
-
-    return orderSuccess;
+    // Executar ordem
+    const order = await newOrder(symbol, side, quantity);
+    return order;
   } catch (error) {
     console.error("Erro ao colocar ordem:", error.message);
+
+    // Notificar sobre erro na ordem
+    telegramNotifier.notifyError(`Erro ao colocar ordem ${side}: ${error.message}`)
+      .catch(err => console.error("Erro ao enviar notificação Telegram:", err.message));
+
     return false;
   }
 }
